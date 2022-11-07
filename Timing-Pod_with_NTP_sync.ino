@@ -1,0 +1,570 @@
+/**
+ * Timing Pods record the Time to Racer Watches/cards upon scan of watch near RFID.
+ * The Pods also display number of tags since switch on (useful for organisers and photographers etc)
+ * as well as Temperature and battery voltage and battery status ('Good', 'OK' and 'Turn Off!')
+ * The Status LED is solid when battery is good, flashing slowly when battery is OK and flashing fast when battery is about to die.
+ * Upon a succesful scan POd will sound a Beep and corner LEDS will light up. No sound or LEDS= no Time written to watch!
+ * 
+ * This Program  has a 'Program mode' and a 'Timing mode'
+ * DipSwitch Number 2 on the PCB toggles between the 2 modes.
+ * Programming mode is used to sync the RTC time to the PC time using the 'Processing' program 'SyncArduinoClock'
+ * Programming mode is also used to set the Stage ID (Stage 1 Start, Stage 2 Finish etc)by swiping a watch/tag during the count down
+ * Timing Mode is used to write the RTC time to racer watch/card. Times are recorded to specific sectors on the watch according to the
+ * Stage ID and latest scan will overwrite previous times!
+ * 
+ * Old way To Sync The RTC Time to PC Timevia processing program called SyncArduinoClock.pde:
+ * 1)Put POD in programming mode (dipswitch 2)
+ * 2) Open up 'Processing' program open file 'SyncArduinoClock'
+ * 3)Plug FTDI cable to POd and PC
+ * 4)Turn on POD and while screen is black, press the 'PLay' button on Processing.
+ * 5)User should see RTC time set to PC time
+ * 6) USer must ensure all Timing PODs times are synced with each other
+ * 
+ * To Set Stage ID:
+ * 1)Put POD in programming mode (dipswitch 2)
+ * 2)Turn on POD and while screen is black, scan a card/watch until desired Stage ID is on screen
+ * (There are a max of 8 Stages to choose from)
+ * (If you do not get to the desired Stage ID before countdown runs out, reset the arduino and carry on scanning)
+ * 3)Put POD out of programming mode (dipswitch 2)
+ * 4) Turn off/on (or reset) POD and check that desired Stage is showing on the top line of LCD
+ * 
+ * displays the Time and displays led and start tone once he has scanned his RFID watch.
+ * The scan time is  written to the RFID watch for download at a later stage
+ * -----------------------------------------------------------------------------------------
+updates 4/9/2021
+removed battery beep -suspect racers might think that is a succesful scan beep and go for it.
+added functionality for ESP-01 to plug in (with code from ESP_NTP_sync_POD.ino) more info here https://www.geekstips.com/arduino-time-sync-ntp-server-esp8266-udp/
+and if in Configure mode, it will update RTC time if connected to internet, confirmed by 3 note doBatteryBeep buzzer  
+
+ESP-01 to BOARD connections
+Gnd   BT Gnd
+3.3   BT VCC (Bit dodgy as this is not 3.3v but could be up to 4.7v)
+RX    BT RX (Pin 9)
+TX    BT TX (Pin8)
+RST   BT EN (VCC)
+*/
+
+//LIBRARIES
+#include <Wire.h>
+#include <MFRC522.h>
+#include <MFRC522Extended.h>  //Library extends MFRC522.h to support RATS for ISO-14443-4 PICC.
+#include <LCD5110_Graph.h> 
+#include <DS3232RTC.h>
+#include <TimeLib.h>
+//#include <Streaming.h>      //not sure this is needed? Dan
+#include "pitches.h"     //if error message involving pitches.h comes up then make sure pitches.h file is in the same directory as the sketch
+//#include "iTimeAfricaV1.h" //comment out if using V2 (Green) PCB
+#include "iTimeAfricaV2.h" //comment out if using V1 (Blue) PCB  and also change lines 168/169 according to PCB used)
+#include <stdlib.h>
+#include <EEPROM.h>
+//#include <SoftwareSerial.h>
+#include <AltSoftSerial.h> //use this because SoftwareSerial library can't handle intterupts. This library uses pin 8 as receive pin and pin 9 as transmit pin https://www.pjrc.com/teensy/td_libs_AltSoftSerial.html
+
+//GLOBAL DEFINITIONS
+int tagCount = 0;                                           // Cont that incremetns on eatch tag read
+int flashLed = LOW;                                         // LED state to implement flashing
+int typeIndex = 0xFF;                                       // Index for pod identity in the pod Type List
+podType thisPod ;                                           // Identity configured for tehis pod
+unsigned long sqCounter = 0;                                // Couner that increments in intterup routine
+unsigned long baseTimeS;                                    // Base time in sec from RTC to withc we sync the ms count
+bool battGood = 1;
+
+char unixString[11];
+long unixTime;
+boolean dataSync = false;
+
+// setup the ESP emulated serial channel
+AltSoftSerial esp8266;
+
+// RFID COMPONENT Create MFRC522 instance
+MFRC522 mfrc522(RFID_CS, LCD_RST);                          // PH pins from PCB header file 
+MFRC522::MIFARE_Key key;
+
+// LCD COMPONENT
+
+LCD5110 myGLCD(LCD_CLK, LCD_DIN , LCD_COM , LCD_RST, LCD_CE);   // PH pins from PCB header file
+extern unsigned char TinyFont[];      // for 5110 LCD display
+extern unsigned char SmallFont[];     // for 5110 LCD display
+extern unsigned char MediumNumbers[]; // for 5110 LCD display
+extern unsigned char BigNumbers[];    // for 5110 LCD display
+
+
+
+void setup() 
+{
+    Wire.begin();                                         // Init I2C buss
+   // PH to use status LED serial needs to be disbaled
+   // Serial.begin(57600);                               // Initialize serial communications with the PC
+   // while (!Serial); {}                                // Do nothing if no serial port is opened (added for Arduinos based on ATMEGA32U4)    
+    setSyncProvider(RTC.get);   // the function to get the time from the RTC
+  
+//    if (timeStatus() != timeSet)  {
+//        Serial.println( F("Unable to sync with the RTC"));
+//    }   else {
+//        Serial.println( F("RTC current time is")); 
+ //   }
+       
+    myGLCD.InitLCD();                                     // initialise LCD 70 default 90 for darker
+    initIoPins();
+    initMfrc522();
+    configrePod();
+    initAfricaTimer();
+}
+
+
+int updateCnt = 0;
+void loop() {
+
+    updateLcdScreen();                      // invoke LCD Screen fucntion
+    // when setSyncInterval(interval); runs out the status is changed to "timeNeedsSync"
+    if ( timeStatus()  == timeNeedsSync ) {      
+        setSyncProvider(RTC.get);           // manual resynch is done
+    }   
+
+    if ( ! mfrc522.PICC_IsNewCardPresent()) {    // Look for new cards
+        return;
+    }
+    if ( ! mfrc522.PICC_ReadCardSerial()) {      // Select one of the cards
+        return;
+    } else {
+        writeCard();                          // call writeCard() function
+        mfrc522.PICC_HaltA();                 // Halt PICC
+        mfrc522.PCD_StopCrypto1();            // Stop encryption on PCD
+    }
+}
+
+
+// interupt is triggered on up and down flanks, we only want one flank
+ISR (PCINT1_vect) {     // handle pin change interrupt for A0 to A5 here
+    if ( digitalRead(SQ_WAVE) == HIGH) {
+        sqCounter ++;                 
+    }
+} 
+
+unsigned long getAfricaTimeMs (){
+    unsigned long ms = sqCounter/1.024;  // tic 1/1024s ms  from stable 1042Hz RTC clock
+    // more efficent calculation but counter over runs every 80 mins, less efficent way has 50day overun.
+    //  unsigned long ms = (sqCounter * 1000) >> 10;  // tic 1/1024s ms  from stable 1042Hz RTC clock
+    return ms;
+}
+
+void writeCard() {
+    unsigned long realMs = getAfricaTimeMs();       // read the ms time from int counter
+    unsigned long baseTimeMs = baseTimeS * 1000;    // convert base time to ms
+    // Time stamp = base time (ms) + realMS (ms)
+    String timestamp     = String(baseTimeMs + realMs);          // converts type unsigned long to type string for getByte function         
+  
+    // Write the epoch time to block  
+    MFRC522::StatusCode status;
+    byte buffer[16] = {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+    timestamp.getBytes(buffer,18);            //converts String to Byte and puts into buffer
+    //byte block = dataBlocks[0];
+    byte block = thisPod.block;
+
+    //  Serial.println(F("Authenticating using key A for podID write..."));
+    status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print( F("PCD_Authenticate() failed: "));
+        Serial.println(mfrc522.GetStatusCodeName(status));
+        return;
+    }
+
+    //  Serial.println(F("Writing epoch time to PICC..."));
+    status = mfrc522.MIFARE_Write(block, buffer, 16);
+    if (status != MFRC522::STATUS_OK) {
+        Serial.print( F("MIFARE_Write() failed: "));
+        Serial.println(mfrc522.GetStatusCodeName(status));
+        return;
+    } else {
+        setupAndBeep();
+    }
+    tagCount ++;
+}
+
+unsigned long flashCount = 0;
+int battBeepCount = 0;
+String getBatteryVoltage() {
+    int sensorValue = analogRead(V_MEAS);          // read the input on analog pin A2 for battery voltage reading:
+    //Serial.println(String(sensorValue));
+    float voltage   = (float)sensorValue / 155;      // For V2 (Green) PCB Convert the analog reading to a voltage adjusted to Pieters multimeter
+//    float voltage   = (float)sensorValue / 269;      // For V1 (Blue) PCBConvert the analog reading to a voltage adjusted to Pieters multimeter
+
+    String batMsg   = F("Good");
+    if (voltage > BATT_GOOD )  {                   // If Voltage higher than 3.8 display "Good" on LCD
+        batMsg    = F("Good");
+        flashLed  = LOW;
+        battGood = 1;
+    } else if ( voltage > BATT_LOW ) {            // If Voltage lower than 3.8 display "Turn off POD" on LCD and flash lights. POD will work until 3.5V but will stop working after that.
+        batMsg = F("OK");
+        battGood = 1;
+        if ( flashCount < sqCounter ){
+            flashCount = sqCounter + BATT_OK_FLASH;            // set toggle time to 5s
+            if ( flashLed == LOW ) {                 
+              flashLed = HIGH;                        // toggle status led previouse state 
+            } else {
+               flashLed = LOW;
+            }
+        }
+    } else {
+        battGood = 0;
+        if ( flashCount < sqCounter ){
+            flashCount = sqCounter + BATT_LOW_FLASH;            // set toggle time to 1s
+            battBeepCount ++;
+            if ( flashLed == LOW ) {                 
+              flashLed = HIGH;                        // toggle status led previouse state 
+            } else {
+              flashLed = LOW;
+            }
+            Serial.println (battBeepCount);
+            if ( battBeepCount > 100 ) {
+              //doBatteryBeep();
+              battBeepCount = 0;              
+            }
+        }
+        batMsg = F("PowerOff");             
+    }
+    char volt[5];
+    String messageBattery = dtostrf(voltage,1,2,volt);       // conver float to string
+    //Serial.println(messageBattery);
+    messageBattery        = messageBattery + "V " + batMsg;  // append status 
+    digitalWrite(STATUS_LED, flashLed); 
+    return messageBattery;
+}
+
+// Displays main Screen Time & Pod station ID
+void updateLcdScreen()    {
+
+    myGLCD.invert (false);
+    // 1st line of display
+    myGLCD.setFont(SmallFont);
+    myGLCD.print((thisPod.podID),CENTER,0);             // Displays POD ID 
+
+//    if (battGood == 0) {
+//         myGLCD.setFont(SmallFont);
+//    myGLCD.print(("Battery Low"),CENTER,10);            
+
+//    } else {
+    //2nd line  Display
+    unsigned long realMs    = getAfricaTimeMs();       // read the ms time from int counter
+    unsigned long ms        = realMs % 1000;               // seperate ms from secconds
+    unsigned long realTimeS = baseTimeS + realMs/1000; // convert to sec for easy display
+//    String msgTime =  "I " + String(hour(realTimeS)) + ":" + String (minute(realTimeS)) + ":" + String(second(realTimeS)) + "." + String(ms);  
+//    Serial.println(msgTime);
+
+    myGLCD.setFont(MediumNumbers);                      // Displays Clock in Medium Numbers
+    myGLCD.printNumI(  hour(realTimeS),0,10,2,'0');          // Minimum number of characters is 2 with on '0' to full the space if minimum is not reached
+    myGLCD.printNumI(minute(realTimeS),29,10,2,'0'); 
+    myGLCD.printNumI(second(realTimeS),58,10,2,'0'); 
+    
+    myGLCD.setFont(MediumNumbers);          // Displays colons
+    myGLCD.drawRect(55,15,57,17);
+    myGLCD.drawRect(55,20,57,22);
+    myGLCD.drawRect(26,15,28,17);
+    myGLCD.drawRect(26,20,28,22);
+    
+    
+    // 3r Line
+    myGLCD.setFont(SmallFont);
+    int temp    = RTC.temperature();
+    int mC      = ((temp*100) % 400 ) /100;
+    String msg  = String(temp/4);
+    msg         = msg + "." + mC + "C";
+    myGLCD.print(msg,LEFT,30);     
+    myGLCD.print(F("Tags: "),RIGHT,30);    
+    myGLCD.print( String(tagCount),RIGHT,30);
+
+    // 4th Line
+    String messageBattery = getBatteryVoltage();  
+    myGLCD.setFont(SmallFont);
+    myGLCD.print(messageBattery,LEFT,40);
+
+    myGLCD.update();
+    myGLCD.clrScr();            
+}
+
+void doBatteryBeep() {
+    int length = 3;
+    int melody[length] = {NOTE_A7, NOTE_C7,NOTE_G7};        
+    int noteDurations[length] = {3, 4, 5};                        // note durations 4 = quarter note, 8 = eighth note, etc.::
+    for (int thisNote = 0; thisNote < length; thisNote++) {
+        int noteDuration = 1000 / noteDurations[thisNote];      //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
+        tone(BUZZER, melody[thisNote], noteDuration);
+        int pauseBetweenNotes = noteDuration * 0.80;            // the note's duration + 30% seems to work well:
+        delay(pauseBetweenNotes); 
+        noTone(BUZZER);                                         // stop the tone playing:
+    }  
+}
+
+void setupAndBeep(){
+    int length = 4;
+    int melody[length] = {NOTE_A7, NOTE_A7, NOTE_A7, NOTE_A7};        // these are the only clear notes with buzzer used!
+    int noteDurations[length] = {8, 8, 8, 8};                        // note durations 4 = quarter note, 8 = eighth note, etc.::
+    beepsLights ( length, melody, noteDurations );
+}
+
+// Beeps and flash leds for succesfull scan
+void beepsLights(int length,int melody[],int noteDurations[]  )    {                                        
+    for (int thisNote = 0; thisNote < length; thisNote++) {
+        int noteDuration = 1000 / noteDurations[thisNote];      //e.g. quarter note = 1000 / 4, eighth note = 1000/8, etc.
+        tone(BUZZER, melody[thisNote], noteDuration);
+        digitalWrite(LED_TOP, LOW);                             // turn  LED on
+        digitalWrite(LED_BOT, LOW);                             // turn  LED on
+
+        int pauseBetweenNotes = noteDuration * 1.30;            // the note's duration + 30% seems to work well:
+        delay(pauseBetweenNotes);
+    
+        noTone(BUZZER);                                         // stop the tone playing:
+        digitalWrite(LED_TOP, HIGH);
+        digitalWrite(LED_BOT, HIGH);
+    }
+}
+/*
+// Configuration functions - Only called once duting setup
+// if config pin is 0 load last state and exit
+*/
+
+// These functions are to define the POD role and synck ms with seconds
+void configrePod() {
+    //turn on all LEDS for config mode warning
+    digitalWrite(STATUS_LED, LOW);    
+    digitalWrite(LED_TOP, LOW);                       
+    digitalWrite(LED_BOT, LOW);
+    // read last pod type index from eeprom and select that identiry as default
+    typeIndex = EEPROM.read(ADDRESS_POD_TYPE);
+    unsigned long ConfigTimeoutMs = millis() + CONFIG_TIME_MS;
+    if ( digitalRead(CONFIG) == 0){
+        // loads previouse config and carries on
+        thisPod = podTypeList[typeIndex];
+        //turn off all LEDS for config mode warning
+        digitalWrite(STATUS_LED, LOW);
+        digitalWrite(LED_TOP, HIGH);                       
+        digitalWrite(LED_BOT, HIGH);  
+        return;
+    } else {
+        // waits for card swipes to change pod definition
+        // allow RTC set from PC via Serial port
+        Serial.begin(9600);
+        esp8266.begin(9600);
+        unsigned long msLeft = CONFIG_TIME_MS;
+        while ( millis() < ConfigTimeoutMs ) {
+            // check for card read and incremetn typeIndex
+            if ( mfrc522.PICC_IsNewCardPresent()) {    // Look for new cards
+                typeIndex++;
+            }
+            if (typeIndex >= LIST_SIZE) {
+                typeIndex = 0;                          // if uninitilized set to 0
+            }
+            thisPod = podTypeList[typeIndex];
+            // display curretn pod id and start countdown to applying config
+            //Serial.println("array size = " + sizeof(thisPod));
+            msLeft = ConfigTimeoutMs - millis();
+            configDisplay (msLeft );
+            delay (100);
+
+  char buffer[40];
+  int i = 0;
+
+  // while the ESP output available, push it
+  // into the buffer and set the flag true
+  while (esp8266.available()) {
+    buffer[i++] = esp8266.read();
+    dataSync = true;
+  }
+
+  // if data is available, parse it
+  if (dataSync == true) {
+
+    if ((buffer[0] == 'U') && (buffer[1] == 'N') && (buffer[2] == 'X')) {
+      // if data sent is the UNX token, take it
+      unixString[0] = buffer[3];
+      unixString[1] = buffer[4];
+      unixString[2] = buffer[5];
+      unixString[3] = buffer[6];
+      unixString[4] = buffer[7];
+      unixString[5] = buffer[8];
+      unixString[6] = buffer[9];
+      unixString[7] = buffer[10];
+      unixString[8] = buffer[11];
+      unixString[9] = buffer[12];
+      unixString[10] = '\0';
+
+      // print the UNX time on the UNO serial
+      Serial.println();
+      Serial.print("TIME FROM ESP: ");
+      Serial.print(unixString[0]);
+      Serial.print(unixString[1]);
+      Serial.print(unixString[2]);
+      Serial.print(unixString[3]);
+      Serial.print(unixString[4]);
+      Serial.print(unixString[5]);
+      Serial.print(unixString[6]);
+      Serial.print(unixString[7]);
+      Serial.print(unixString[8]);
+      Serial.print(unixString[9]);
+      Serial.println();
+      
+      unixTime = atol(unixString);
+      // Synchronize the time with the RTC clock
+
+      RTC.set(unixTime);
+      setTime(unixTime);
+      doBatteryBeep();
+      dataSync = false;
+    }
+  }           
+           // check for RTC time sync from pc using processing program
+            if (Serial.available()) {
+                time_t t = processSyncMessage();
+                if (t != 0) {
+                    RTC.set(t);   // set the RTC and the system time to the received value
+                    setTime(t);          
+                }
+            }
+
+            digitalClockToSerial();
+        }
+    // save pod type in EEPROM for next boot
+    EEPROM.write(ADDRESS_POD_TYPE, typeIndex);
+    }
+    //turn off all LEDS for config mode warning
+    digitalWrite(STATUS_LED, HIGH);
+    digitalWrite(LED_TOP, HIGH);                       
+    digitalWrite(LED_BOT, HIGH);  
+}
+
+// Display fucntion during config loop
+void configDisplay( unsigned long timeLeftMs)   {
+    myGLCD.invert (true);
+     // 1st line of display
+    myGLCD.setFont(SmallFont);
+    String msg = VERSION;
+    msg = msg + F(" Configure ");
+    myGLCD.print(msg,LEFT,0);       
+
+   //2nd line  Display
+    myGLCD.setFont(SmallFont);          
+    myGLCD.print( F("DON'T TAG!"),CENTER,10);        
+
+    //3rd line  Display
+    myGLCD.setFont(SmallFont);          
+    myGLCD.print((thisPod.podID),CENTER,20);        
+ 
+    // 4th Line
+    myGLCD.setFont(SmallFont);
+    myGLCD.print( F("Swipe2Change"),CENTER,30);
+
+    // 5th Line
+    String timeMsg = F("Done in ");
+    unsigned long ms = (timeLeftMs % 1000)/100;
+    timeMsg = timeMsg + (timeLeftMs/1000) + "." + ms + "s";
+    myGLCD.setFont(SmallFont);
+    myGLCD.print(timeMsg,LEFT,40);
+
+    myGLCD.update();
+    myGLCD.clrScr();
+}
+
+// All Genral Purpouse IO pin Setup stuffs 
+void initIoPins() {
+    // Input Pins
+    pinMode(SQ_WAVE, INPUT);
+    pinMode(CONFIG, INPUT);
+
+    // Output Pins
+    pinMode(LED_TOP, OUTPUT);
+    pinMode(LED_BOT, OUTPUT);
+    pinMode(STATUS_LED, OUTPUT);
+    // set pins start condition: LOW = LED on, HIGH = LED off
+    digitalWrite(LED_TOP, HIGH);                       
+    digitalWrite(LED_BOT, HIGH);                       
+    digitalWrite(STATUS_LED, LOW);                     
+}
+
+// All RFID init Stuffs
+void initMfrc522() {
+    SPI.begin();                                          // Init SPI bus
+    mfrc522.PCD_Init();                                   // Init MFRC522 card
+    mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);       // Enhance the MFRC522 Receiver Gain to maximum value of some 48 dB (default is 33dB)
+
+    for (byte i = 0; i < 6; i++) {                // Prepare the key (used both as key A and as key B) using FFFFFFFFFFFFh which is the default at chip delivery from the factory
+        key.keyByte[i] = 0xFF;
+    }
+}
+
+/* set up timer to run odd the interupt driven by the 1024Hz TRC square wave
+ * Read a base time in seconds from RTC ( unix time) 
+ * thre RTC second has started counting.\, assume ~250ms has passed - initilize counter.
+ * from now use the interupt counters time to increment real time and provide a ms
+ */
+void initAfricaTimer(){
+    setSyncProvider(RTC.get);                            // gets RTC time
+    RTC.squareWave(SQWAVE_1024_HZ);                      // Set RTC Square wave frequany 
+
+    // Set up interup
+    *digitalPinToPCMSK(SQ_WAVE) |= bit (digitalPinToPCMSKbit(SQ_WAVE));  // enable pin
+    PCIFR  |= bit (digitalPinToPCICRbit(SQ_WAVE)); // clear any outstanding interrupt
+    PCICR  |= bit (digitalPinToPCICRbit(SQ_WAVE)); // enable interrupt for the group
+    // Try allign with rtc tick ~ shuold be accurate withing 25ms
+    baseTimeS = RTC.get();
+    while ( RTC.get() < (baseTimeS +1)) {}; 
+    sqCounter = 0;                                  // zero qsuare wave counter 
+
+    // set base time to H:m:s of today
+    baseTimeS           = RTC.get();                      
+    String msgTime =  "R " + String(hour(baseTimeS)) + ":" + String (minute(baseTimeS)) + ":" + String(second(baseTimeS)) ;  
+    Serial.println(msgTime);
+    unsigned long secToday        = second(baseTimeS);
+    unsigned long minToday        = minute(baseTimeS);
+    unsigned long hourToday       = hour(baseTimeS);
+    unsigned long today           = weekday(baseTimeS);
+    msgTime =  "Today " + String(today) + " - " + String(hourToday) + ":" + String (minToday) + ":" + String(secToday) ;  
+    Serial.println(msgTime);
+
+    // Regester our base time now with only D H:m:s; 
+    baseTimeS     =  (hourToday * 60 * 60) + (minToday * 60) + secToday;   
+    //baseTimeS     =  (today * 24 * 60 * 60 ) + (hourToday * 60 * 60) + (minToday * 60) + secToday;           
+
+    // msgTime =  "I " + String(hour(baseTimeS)) + ":" + String (minute(baseTimeS)) + ":" + String(second(baseTimeS)) ;  
+    // Serial.println(msgTime);
+    // Serial.println("GO " + String(baseTimeS));
+}
+
+void digitalClockToSerial(){
+    // digital clock display of the time
+    Serial.print(hour());
+    printDigits(minute());
+    printDigits(second());
+    Serial.print(" ");
+    Serial.print(day());
+    Serial.print(" ");
+    Serial.print(month());
+    Serial.print(" ");
+    Serial.print(year()); 
+    Serial.println(); 
+}
+
+void printDigits(int digits){
+    // utility function for digital clock display: prints preceding colon and leading 0
+    Serial.print((":"));
+    if(digits < 10) {
+        Serial.print('0');
+    }
+    Serial.print(digits);
+}
+
+/*  code to process time sync messages from the serial port using SyncArduinoClock.pde through processing program (not needed now that we use NTP vai ESP-01   */
+#define TIME_HEADER  "T"   // Header tag for serial time sync message
+
+unsigned long processSyncMessage() {
+  unsigned long pctime = 0L;
+  const unsigned long DEFAULT_TIME = 1357041600; // Jan 1 2013 
+
+  if(Serial.find(TIME_HEADER)) {
+     pctime = Serial.parseInt();
+     return pctime;
+     if( pctime < DEFAULT_TIME) { // check the value is a valid time (greater than Jan 1 2013)
+       pctime = 0L; // return 0 to indicate that the time is not valid
+     }
+  }
+  return pctime;
+}
